@@ -1,0 +1,6 @@
+{
+  "format": "docker-v2",
+  "reference": "registry.example.com/library/payments:1.4.2",
+  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "labels": {"team": "payments"}
+}

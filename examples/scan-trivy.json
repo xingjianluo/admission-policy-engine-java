@@ -1,0 +1,9 @@
+{
+  "scanner": "trivy",
+  "imageDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "results": [
+    {"target": "payments", "vulnerabilities": [
+      {"VulnerabilityID": "CVE-2026-1001", "Severity": "MEDIUM", "PkgName": "libssl", "FixedVersion": "3.0.9"}
+    ]}
+  ]
+}

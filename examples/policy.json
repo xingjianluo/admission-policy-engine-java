@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {"id": "DENY-HIGH-CRITICAL", "name": "deny-high-or-critical",
+     "effect": "DENY", "priority": 100,
+     "denyIfSeverityAtLeast": "HIGH",
+     "description": "存在 HIGH 及以上漏洞时拒绝"},
+    {"id": "ALLOW-TRUSTED", "name": "allow-trusted-source",
+     "effect": "ALLOW", "priority": 50,
+     "registries": ["registry.example.com"],
+     "repositoryPattern": "library/.*|platform/.*",
+     "sourceUris": ["https://git.example.com/platform/payments"],
+     "minSlsaLevel": 3,
+     "description": "受信仓库与 SLSA3 来源允许"},
+    {"id": "ALLOW-MEDIUM", "name": "allow-medium-and-below",
+     "effect": "ALLOW", "priority": 10,
+     "maxAllowedSeverity": "MEDIUM",
+     "description": "漏洞不超过 MEDIUM 允许"}
+  ]
+}

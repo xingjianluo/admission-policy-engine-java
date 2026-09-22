@@ -1,0 +1,17 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [{"name": "payments", "digest": {"sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "attestationDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "predicate": {
+    "builder": {"id": "trusted-builder-1"},
+    "buildDefinition": {
+      "externalParameters": {
+        "repository": "https://git.example.com/platform/payments",
+        "revision": "9f2c1a7"
+      },
+      "slsaBuildLevel": 3
+    },
+    "materials": ["sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"]
+  }
+}
