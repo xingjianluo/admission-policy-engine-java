@@ -12,6 +12,12 @@ public record PolicySnapshot(
         Instant createdAt,
         String createdBy,
         String changeComment,
-        List<PolicyRule> rules
+        List<PolicyRule> rules,
+        String label
 ) {
+    /** 正式版本链快照：版本标签固定为 "v" + 版本号。 */
+    public PolicySnapshot(long version, Instant createdAt, String createdBy,
+                          String changeComment, List<PolicyRule> rules) {
+        this(version, createdAt, createdBy, changeComment, rules, "v" + version);
+    }
 }

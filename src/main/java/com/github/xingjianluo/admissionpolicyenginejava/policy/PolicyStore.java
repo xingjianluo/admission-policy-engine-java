@@ -33,4 +33,11 @@ public interface PolicyStore {
 
     /** 列出全部版本（版本号升序）。 */
     List<PolicySnapshot> history();
+
+    /**
+     * 校验并冻结一组规则（与正式发布走完全相同的规则集合法性检查），
+     * 供策略预演在不发布的前提下验证候选规则集。
+     * 规则不合法时抛出与发布一致的 {@code AdmissionException}（调用方不得放过）。
+     */
+    List<PolicyRule> validateRules(List<PolicyRule> rules);
 }

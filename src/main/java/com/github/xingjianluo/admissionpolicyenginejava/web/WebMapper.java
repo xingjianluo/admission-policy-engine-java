@@ -3,7 +3,9 @@ package com.github.xingjianluo.admissionpolicyenginejava.web;
 import com.github.xingjianluo.admissionpolicyenginejava.error.AdmissionException;
 import com.github.xingjianluo.admissionpolicyenginejava.error.ErrorCode;
 import com.github.xingjianluo.admissionpolicyenginejava.ingest.ArtifactKind;
+import com.github.xingjianluo.admissionpolicyenginejava.ingest.BatchItemInput;
 import com.github.xingjianluo.admissionpolicyenginejava.ingest.IngestionRequest;
+import com.github.xingjianluo.admissionpolicyenginejava.ingest.PreparedBatchItem;
 import com.github.xingjianluo.admissionpolicyenginejava.ingest.RawArtifact;
 import com.github.xingjianluo.admissionpolicyenginejava.model.Caller;
 import com.github.xingjianluo.admissionpolicyenginejava.model.PolicyEffect;
@@ -11,6 +13,7 @@ import com.github.xingjianluo.admissionpolicyenginejava.policy.ConditionType;
 import com.github.xingjianluo.admissionpolicyenginejava.policy.PolicyCondition;
 import com.github.xingjianluo.admissionpolicyenginejava.policy.PolicyRule;
 import com.github.xingjianluo.admissionpolicyenginejava.web.dto.WebDtos.ArtifactDto;
+import com.github.xingjianluo.admissionpolicyenginejava.web.dto.WebDtos.BatchItemDto;
 import com.github.xingjianluo.admissionpolicyenginejava.web.dto.WebDtos.CallerDto;
 import com.github.xingjianluo.admissionpolicyenginejava.web.dto.WebDtos.ConditionDto;
 import com.github.xingjianluo.admissionpolicyenginejava.web.dto.WebDtos.EvaluateRequest;
@@ -101,6 +104,48 @@ final class WebMapper {
                     r.description()));
         }
         return List.copyOf(out);
+    }
+
+    /**
+     * 把单个批量项 DTO 安全地转成领域输入。
+     * 单项 DTO 结构非法（空条目、未知 kind、工件为空等）时不抛出，
+     * 而是返回携带错误码/原因的 PreparedBatchItem，由服务只标记该项、不影响整批其余项。
+     */
+    static PreparedBatchItem prepareBatchItem(BatchItemDto item) {
+        try {
+            return PreparedBatchItem.of(toBatchItem(item));
+        } catch (AdmissionException e) {
+            String reference = item == null ? null : item.reference();
+            return PreparedBatchItem.invalid(e.getCode().name(),
+                    "镜像项(" + reference + ") " + e.getMessage());
+        }
+    }
+
+    /** 把单个批量项 DTO 转成领域输入；单项字段问题直接抛 AdmissionException。 */
+    static BatchItemInput toBatchItem(BatchItemDto item) {
+        if (item == null) {
+            throw new AdmissionException(ErrorCode.INVALID_REQUEST, "批量中存在空的镜像条目");
+        }
+        if (item.artifacts() == null || item.artifacts().isEmpty()) {
+            throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                    "镜像项(" + item.reference() + ") artifacts 不能为空");
+        }
+        List<RawArtifact> raw = new ArrayList<>(item.artifacts().size());
+        for (ArtifactDto a : item.artifacts()) {
+            if (a == null || a.kind() == null) {
+                throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                        "镜像项(" + item.reference() + ") 工件缺少 kind");
+            }
+            final ArtifactKind kind;
+            try {
+                kind = ArtifactKind.valueOf(a.kind().trim().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                        "镜像项(" + item.reference() + ") 未知工件类别 kind=" + a.kind());
+            }
+            raw.add(new RawArtifact(kind, a.format(), a.content()));
+        }
+        return new BatchItemInput(item.reference(), List.copyOf(raw));
     }
 
     private static String blankToNull(String s) {

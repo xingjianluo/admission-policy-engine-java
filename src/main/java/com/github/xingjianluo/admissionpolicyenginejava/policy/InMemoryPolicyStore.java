@@ -2,6 +2,7 @@ package com.github.xingjianluo.admissionpolicyenginejava.policy;
 
 import com.github.xingjianluo.admissionpolicyenginejava.error.AdmissionException;
 import com.github.xingjianluo.admissionpolicyenginejava.error.ErrorCode;
+import com.github.xingjianluo.admissionpolicyenginejava.model.Severity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -96,6 +97,11 @@ public class InMemoryPolicyStore implements PolicyStore {
         return List.copyOf(versions);
     }
 
+    @Override
+    public List<PolicyRule> validateRules(List<PolicyRule> rules) {
+        return validateAndFreeze(rules);
+    }
+
     private List<PolicyRule> validateAndFreeze(List<PolicyRule> rules) {
         List<PolicyRule> frozen = new ArrayList<>(rules.size());
         HashSet<String> ids = new HashSet<>();
@@ -121,8 +127,49 @@ public class InMemoryPolicyStore implements PolicyStore {
                                 + " 不在兼容范围 [" + SUPPORTED_SCHEMA_MIN + ", "
                                 + SUPPORTED_SCHEMA_MAX + "] 内");
             }
+            validateConditions(rule);
             frozen.add(rule);
         }
         return List.copyOf(frozen);
+    }
+
+    /** 条件级语义校验：需要 value 的条件必须带非空 value，严重级别阈值必须可识别。 */
+    private void validateConditions(PolicyRule rule) {
+        List<PolicyCondition> conditions = rule.conditions();
+        for (PolicyCondition c : conditions) {
+            if (c == null || c.type() == null) {
+                throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                        "规则 " + rule.id() + " 存在缺少 type 的条件");
+            }
+            switch (c.type()) {
+                case SEVERITY_AT_LEAST -> {
+                    if (c.value() == null || c.value().isBlank()) {
+                        throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                                "规则 " + rule.id() + " 的 SEVERITY_AT_LEAST 条件缺少 value");
+                    }
+                    try {
+                        Severity threshold = Severity.valueOf(c.value().trim().toUpperCase());
+                        if (threshold == Severity.UNKNOWN) {
+                            throw new IllegalArgumentException();
+                        }
+                    } catch (IllegalArgumentException e) {
+                        throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                                "规则 " + rule.id() + " 的 SEVERITY_AT_LEAST 阈值无法识别: "
+                                        + c.value());
+                    }
+                }
+                case REGISTRY_EQUALS, REGISTRY_NOT_EQUALS, REPOSITORY_PREFIX,
+                        BUILDER_ID_EQUALS, SOURCE_URI_PREFIX -> {
+                    if (c.value() == null || c.value().isBlank()) {
+                        throw new AdmissionException(ErrorCode.INVALID_REQUEST,
+                                "规则 " + rule.id() + " 的条件 " + c.type() + " 缺少非空 value");
+                    }
+                }
+                case PROVENANCE_PRESENT, PROVENANCE_MISSING,
+                        SIGNATURE_VERIFIED, SIGNATURE_NOT_VERIFIED -> {
+                    // 存在性/布尔类条件不需要 value。
+                }
+            }
+        }
     }
 }

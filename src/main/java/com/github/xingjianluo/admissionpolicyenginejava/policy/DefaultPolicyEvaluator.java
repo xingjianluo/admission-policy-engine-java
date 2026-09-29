@@ -64,7 +64,7 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
         if (decisive.isEmpty()) {
             decision = Decision.DENY;
             rationale = "无策略规则命中，按 fail-closed 默认拒绝（镜像: " + d.reference()
-                    + ", digest: " + d.digest() + ", 策略版本 v" + snapshot.version() + "）";
+                    + ", digest: " + d.digest() + ", 策略快照 " + snapshot.label() + "）";
         } else {
             MatchedRule r = decisive.get();
             decision = r.effect() == PolicyEffect.ALLOW ? Decision.ALLOW : Decision.DENY;
@@ -77,7 +77,7 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
             rationale = "决定性规则 " + r.ruleId() + "(priority=" + r.priority()
                     + ", effect=" + r.effect() + ")，命中依据[" + r.reason() + "]"
                     + conflictNote
-                    + "。基于策略版本 v" + snapshot.version() + " 做出 " + decision + " 判定。";
+                    + "。基于策略快照 " + snapshot.label() + " 做出 " + decision + " 判定。";
         }
 
         DecisionReport report = new DecisionReport(decision, snapshot.version(),
