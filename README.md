@@ -9,6 +9,8 @@
 - 一次评估只引用一个不可变策略快照，评估期间不受任何更新影响
 - RBAC 鉴权：**鉴权拒绝（401）与策略拒绝（DENY，HTTP 200）严格区分**
 - 审计按幂等键去重，并发/重复提交只产生一条记录
+- **批量评估**：一批镜像逐项出结论，单项坏输入只标记该项不拖垮整批，批量有明确上限
+- **策略预演**：用候选规则对同一批镜像给“现网 vs 候选”双侧对照，**不发布、不产生正式版本**
 
 ---
 
@@ -36,10 +38,12 @@
 | `policy` | `PolicyRule` / `PolicyCondition` / `ConditionType` | 策略规则与匹配条件模型 |
 | `policy` | `InMemoryPolicyStore` | 不可变版本链、乐观锁发布、回滚 |
 | `policy` | `DefaultPolicyEvaluator` | 条件匹配、优先级/冲突裁决、可解释依据 |
+| `policy` | `PolicyRuleSetValidator` | 规则集合法性校验，**发布与预演共用同一套规则** |
 | `security` | `RbacAuthorizer` | 角色 → 权限校验 |
 | `audit` | `InMemoryAuditService` | 幂等占位 + 去重留痕 |
 | `service` | `DefaultAdmissionService` / `DefaultPolicyAdminService` | 用例编排、鉴权与审计 |
-| `web` | 3 个 Controller + `GlobalExceptionHandler` | HTTP 接口与错误码映射 |
+| `service` | `DefaultBatchAdmissionService` / `DefaultPolicyRehearsalService` | 批量评估、候选规则预演对照 |
+| `web` | 5 个 Controller + `GlobalExceptionHandler` | HTTP 接口与错误码映射 |
 
 ---
 
@@ -221,6 +225,8 @@ vulnerability.package.2=curl
 | 方法与路径 | 说明 | 权限 |
 |---|---|---|
 | `POST /api/admission/evaluate` | 提交工件进行准入评估；body 带 `caller` 与 `idempotencyKey` | EVALUATE |
+| `POST /api/admission/batch-evaluate` | 批量评估一批镜像，逐项出结论（单项坏输入只标记该项） | EVALUATE |
+| `POST /api/admission/rehearse` | 策略预演：候选规则 vs 现网策略双侧对照，不发布、不留正式版本 | EVALUATE |
 | `POST /api/policies/update` | 发布新策略版本（body 带 `expectedBaseVersion`） | UPDATE_POLICY |
 | `POST /api/policies/rollback` | 回滚到 `targetVersion`（产生新版本） | ROLLBACK_POLICY |
 | `GET /api/policies/current` | 当前策略快照 | READ_POLICY |
@@ -231,8 +237,10 @@ vulnerability.package.2=curl
 ### 审计记录（`AuditRecord`）
 
 字段：`id`、`timestamp`、`caller`、`action`（`ADMISSION_EVALUATE` /
-`POLICY_UPDATE` / `POLICY_ROLLBACK`）、`imageDigest`、`policyVersion`、
-`decision`、`rationale`（最终结论依据）、`detail`（引用与命中规则列表）。
+`POLICY_UPDATE` / `POLICY_ROLLBACK` / `BATCH_EVALUATE` /
+`BATCH_EVALUATE_INPUT_ERROR` / `POLICY_REHEARSE` / `POLICY_REHEARSE_INPUT_ERROR`）、
+`imageDigest`、`policyVersion`、`decision`、`rationale`（最终结论依据）、
+`detail`（引用与命中规则列表；预演另含候选规则指纹与双侧决定性规则）。
 
 - 幂等键 = SHA-256(`caller | digest | policyVersion | idempotencyKey`)。
 - 评估前**原子占位**：并发或重复提交相同键时，只有首个请求真正评估并写一条记录，
@@ -240,7 +248,139 @@ vulnerability.package.2=curl
 
 ---
 
-## 7. 本地验证方法
+## 7. 批量评估与策略预演（上线前看清影响）
+
+### 7.1 批量评估 `POST /api/admission/batch-evaluate`
+
+一次提交一批镜像，**每个镜像各自给出结论**，一眼看出这批里谁过、谁不过。
+
+请求体：
+
+```json
+{
+  "idempotencyKey": "batch-2026-09-30-001",
+  "caller": { "name": "reader-1", "roles": ["READER"] },
+  "items": [
+    { "reference": "gcr.internal/team-a/app:1.0.0", "artifacts": [ /* 与单次评估相同形态的工件数组 */ ] },
+    { "reference": "gcr.internal/team-b/web:2.3",   "artifacts": [ /* ... */ ] }
+  ]
+}
+```
+
+响应（`BatchEvaluationReport`）：
+
+```json
+{
+  "policyVersion": 1, "totalCount": 3,
+  "allowedCount": 0, "deniedCount": 2, "errorCount": 1,
+  "items": [
+    { "index": 0, "reference": "...", "status": "EVALUATED",
+      "report": { "decision": "DENY", "policyVersion": 1, "matchedRules": [ ... ],
+                  "decisiveRule": { "ruleId": "deny-missing-provenance", ... }, "rationale": "..." },
+      "errorCode": null, "errorMessage": null },
+    { "index": 1, "reference": "...", "status": "INPUT_ERROR", "report": null,
+      "errorCode": "FINGERPRINT_MISMATCH", "errorMessage": "..." }
+  ]
+}
+```
+
+**批量上限与输入要求**
+
+- 单次最多 **`100`** 项（`DefaultBatchAdmissionService.MAX_BATCH_SIZE`，预演同上限）。
+  超过 100 → **400 `INVALID_REQUEST`**，提示“超过上限 100，请拆分”；空批同样 400。
+- 每个 `items[i]` 的 `reference` 必填、`artifacts` 至少含一个 MANIFEST，
+  工件 `kind/format/content` 要求与单次评估完全一致（见第 2 节）。
+- **单项坏输入不拖垮整批**：某项畸形 JSON、缺字段、指纹不一致、缺 MANIFEST 等，
+  只把该项标为 `status=INPUT_ERROR` 并给出可区分的 `errorCode` / `errorMessage`，
+  其余项照常 `EVALUATED` 出结论。结构性错误（缺 reference、未知 kind、空条目）在
+  Web 组装阶段即落到该项，同样不影响其他项。
+- 整批在处理任何一项**之前**固定一份当前策略快照引用：整批看到的是同一个
+  `policyVersion`，评估期间他人发布/回滚不影响本批。
+
+### 7.2 策略预演 `POST /api/admission/rehearse`
+
+在**不真正发布**的前提下，用一组候选规则对同一批镜像做双侧对照：
+现网策略下结论 vs 换成候选规则后结论。
+
+请求体（`items` 形态与批量评估一致，另加 `candidateRules`，规则形态同发布接口）：
+
+```json
+{
+  "idempotencyKey": "rehe-2026-09-30-001",
+  "caller": { "name": "reader-1", "roles": ["READER"] },
+  "items": [ { "reference": "...", "artifacts": [ ... ] } ],
+  "candidateRules": [
+    { "id": "candidate-allow-internal", "priority": 100, "effect": "ALLOW",
+      "schemaVersion": 1, "conditions": [ { "type": "REGISTRY_EQUALS", "value": "gcr.internal" } ] }
+  ]
+}
+```
+
+响应（`RehearsalReport`）：
+
+```json
+{
+  "currentPolicyVersion": 1,
+  "candidateFingerprint": "446b9479623943c6",
+  "totalCount": 1, "changedCount": 1,
+  "allowToDenyCount": 0, "denyToAllowCount": 1, "unchangedCount": 0, "errorCount": 0,
+  "items": [
+    { "index": 0, "reference": "...", "status": "EVALUATED",
+      "currentReport":   { "decision": "DENY",  "decisiveRule": { "ruleId": "deny-missing-provenance" } },
+      "candidateReport": { "decision": "ALLOW", "decisiveRule": { "ruleId": "candidate-allow-internal" } },
+      "change": "DENY_TO_ALLOW", "errorCode": null, "errorMessage": null }
+  ]
+}
+```
+
+**对照结果怎么看**
+
+- 每个有效项同时给 `currentReport`（现网）与 `candidateReport`（候选）两份完整结论，
+  各自带 `matchedRules` / `decisiveRule` / `rationale`，**变化时由哪条规则决定一目了然**。
+- `change`：
+  - `DENY_TO_ALLOW`：现网拒绝、候选放行（新规则会“放过”它）；
+  - `ALLOW_TO_DENY`：现网放行、候选拒绝（新规则会“拦下”它，**上线重点风险**）；
+  - `UNCHANGED`：两侧一致。
+- 汇总字段直接数出变化项数、两个方向各多少、不变多少、输入错误多少。
+- `candidateReport.policyVersion` 恒为 **`-1`**（`CANDIDATE_VERSION`），明确标识
+  “这是未发布候选”，区别于任何正式版本号；`candidateFingerprint` 是候选规则集内容指纹
+  （按规则字段确定性序列化后哈希，与提交顺序无关）。
+
+**安全性与一致性保证**
+
+- **绝不触碰线上**：候选规则只存在于本次请求内存中的候选快照，**不发布、不产生正式版本、
+  不改当前策略**；预演后 `/api/policies/current` 版本不变、`/history` 长度不变。
+- **候选规则非法与正式发布同规处理**：候选先经与 `POST /policies/update` 完全相同的
+  规则集校验（空集、重复 id、缺 effect、`schemaVersion` 越界等），非法时整次预演被拒绝
+  （如 422 `POLICY_SCHEMA_UNSUPPORTED`），**不会悄悄放过**，现网与版本链均不变。
+- **对照基于同一份现网策略**：处理任何一项之前取一次当前快照，整次预演的“现网一侧”
+  全部锚定该 `currentPolicyVersion`。预演期间即使他人发布/回滚，也不会出现
+  一半旧、一半新的对照（并发自洽由测试 900 个逐项校验覆盖）。
+- **可复现**：双侧评估都是对不可变快照的纯函数；同一批输入 + 同一份现网策略 +
+  同一份候选（指纹相同），重复预演任意次结果完全一致。
+- 批量上限、单项坏输入隔离规则与批量评估相同（上限 100）。
+
+### 7.3 鉴权、审计与幂等
+
+- 两个接口都需要 **`EVALUATE`** 权限（READER/AUDITOR/ADMIN）。未授权 →
+  **401 `UNAUTHORIZED`**，这与“项内策略结论 DENY（HTTP 200）”是**不同通道**，
+  不会把“没权限”误读成“策略不许过”。
+- 审计新增动作（`/api/audit/...` 可查）：
+  - `BATCH_EVALUATE` / `BATCH_EVALUATE_INPUT_ERROR`
+  - `POLICY_REHEARSE` / `POLICY_REHEARSE_INPUT_ERROR`
+
+  记录含**谁（caller）、什么时候（timestamp）、对哪个镜像（imageDigest）、
+  用的哪份策略（现网 `policyVersion` + `candidateFingerprint`）、双侧决定性规则与结论**。
+- 逐项按幂等键去重：审计 id 由
+  `动作 | caller | 现网版本 | 候选指纹(预演) | 整批 idempotencyKey | 下标 | 镜像指纹` 派生。
+  **同一批请求用相同 `idempotencyKey` 重复提交，不产生重复审计记录**，结论仍稳定返回；
+  不同 `idempotencyKey` 视为不同批次，分别留痕。
+
+---
+
+---
+
+## 8. 本地验证方法
 
 ### 运行全部测试
 
@@ -248,7 +388,8 @@ vulnerability.package.2=curl
 mvn test
 ```
 
-32 个测试，覆盖四类关键场景，且单测日志中打印**评估输入、命中的策略与最终判定依据**：
+46 个测试，覆盖原有四类关键场景与新增的批量/预演场景，且单测日志中打印
+**评估输入、命中的策略与最终判定依据**：
 
 | 测试类 | 数量 | 覆盖内容 |
 |---|---|---|
@@ -257,6 +398,11 @@ mvn test
 | `PolicyStoreVersioningTest` | 7 | 乐观锁冲突、回滚产生新版本且保留历史、版本不存在、schema 越界、重复 id、**16 线程并发更新**与快照一致性 |
 | `AdmissionIntegrationTest` | 6 | 未授权 vs 策略 DENY 区分、端到端 DENY/ALLOW、审计内容完整、越权更新、READER/AUDITOR 审计权限、重复提交幂等 |
 | `ConcurrencyIntegrationTest` | 3 | 12 线程同版本竞争（恰 1 成功其余 409）、更新期间 8 线程×50 轮评估版本自洽稳定、10 个相同并发请求只产生 1 条审计 |
+| `BatchEvaluationIntegrationTest` | 5 | 批量逐项结论与汇总、坏输入只标记该项不影响其他项、空批/超 100 上限拒绝、未授权 401、重复批次不重复留痕 |
+| `PolicyRehearsalIntegrationTest` | 8 | 双侧对照与变化方向/决定性规则、预演不发布不留版本、非法候选与发布同规拒绝、6 次重复可复现、坏输入隔离、未授权、重复预演幂等、ALLOW→DENY 方向 |
+| `RehearsalConcurrencyIntegrationTest` | 1 | 预演期间管理员持续发布/回滚，6 线程×30 轮×5 项（900 个逐项校验）两侧结论始终锚定同一份当前快照，不出现新旧混合 |
+
+> 新增功能不改变既有单镜像评估、发布/回滚与审计行为：原有 32 个用例全部不回归。
 
 查看带输入/命中规则/判定依据的详细日志：
 
@@ -309,9 +455,45 @@ curl -s -X POST http://localhost:8099/api/policies/rollback \
 - `schemaVersion=99` → **422 POLICY_SCHEMA_UNSUPPORTED**（提示兼容范围 [1,2]）
 - 相同 `idempotencyKey` 提交两次 → 审计记录仅 +1
 
+### 手工验证批量评估与预演
+
+```bash
+# 批量评估：3 项中混入一个指纹不一致项 → 2 个 DENY + 1 个 INPUT_ERROR
+curl -s -X POST http://localhost:8099/api/admission/batch-evaluate \
+  -H "Content-Type: application/json" -d '{
+    "idempotencyKey":"smoke-batch-1","caller":{"name":"reader-1","roles":["READER"]},
+    "items":[
+      {"reference":"gcr.internal/team-a/app:1.0.0","artifacts":[
+        {"kind":"MANIFEST","format":"OCI-MANIFEST","content":"{\"digest\":\"sha256:smk0001\",\"config\":{\"digest\":\"sha256:smk0001\"},\"annotations\":{\"io.xj.registry\":\"gcr.internal\",\"io.xj.repository\":\"team-a/app\"}}"},
+        {"kind":"VULN_SCAN","format":"CYCLONEDX-JSON","content":"{\"digest\":\"sha256:smk0001\",\"vulnerabilities\":[]}"}]},
+      {"reference":"gcr.internal/bad:1","artifacts":[
+        {"kind":"MANIFEST","format":"OCI-MANIFEST","content":"{\"digest\":\"sha256:smk0003\",\"config\":{\"digest\":\"sha256:smk0003\"},\"annotations\":{\"io.xj.registry\":\"gcr.internal\",\"io.xj.repository\":\"bad\"}}"},
+        {"kind":"VULN_SCAN","format":"CYCLONEDX-JSON","content":"{\"digest\":\"sha256:DIFFERENT\",\"vulnerabilities\":[]}"}]}
+    ]}'
+
+# 预演：候选规则“内部放行”，看 change=DENY_TO_ALLOW；预演后 current 仍为 v1
+curl -s -X POST http://localhost:8099/api/admission/rehearse \
+  -H "Content-Type: application/json" -d '{
+    "idempotencyKey":"smoke-rehe-1","caller":{"name":"reader-1","roles":["READER"]},
+    "items":[{"reference":"gcr.internal/team-a/app:1.0.0","artifacts":[
+        {"kind":"MANIFEST","format":"OCI-MANIFEST","content":"{\"digest\":\"sha256:smk0001\",\"config\":{\"digest\":\"sha256:smk0001\"},\"annotations\":{\"io.xj.registry\":\"gcr.internal\",\"io.xj.repository\":\"team-a/app\"}}"},
+        {"kind":"VULN_SCAN","format":"CYCLONEDX-JSON","content":"{\"digest\":\"sha256:smk0001\",\"vulnerabilities\":[]}"}]}],
+    "candidateRules":[{"id":"candidate-allow-internal","priority":100,"effect":"ALLOW","schemaVersion":1,
+      "conditions":[{"type":"REGISTRY_EQUALS","value":"gcr.internal"}]}]}'
+
+# 查留痕：同一指纹下可见 BATCH_EVALUATE 与 POLICY_REHEARSE
+curl -s "http://localhost:8099/api/audit/by-digest?digest=sha256:smk0001" -H "X-Caller: aud|AUDITOR"
+```
+
+预期：批量响应 `errorCount=1` 且坏项 `status=INPUT_ERROR/errorCode=FINGERPRINT_MISMATCH`，
+另一项仍为 `EVALUATED`；预演响应 `denyToAllowCount=1`、`change=DENY_TO_ALLOW`、
+`candidateReport.decisiveRule.ruleId=candidate-allow-internal`，预演前后
+`/api/policies/current` 都为 v1；GUEST 调两接口 → **401**；101 项 → **400**；
+候选 `schemaVersion=99` → **422**；相同 `idempotencyKey` 再发一次审计条数不变。
+
 ---
 
-## 8. 设计要点小结
+## 9. 设计要点小结
 
 - **一致性**：快照不可变 + 评估前固定引用 + 版本链读无锁，更新/回滚与评估完全隔离。
 - **并发安全**：发布/回滚在同一把锁内“检查当前版本→追加”，配合乐观版本号，保证串行化、
@@ -319,3 +501,8 @@ curl -s -X POST http://localhost:8099/api/policies/rollback \
 - **可解释**：每条命中都带事实依据，最终结论说明决定性规则与冲突解决方式。
 - **可区分**：输入错误、鉴权拒绝、策略拒绝三条独立通道，错误码与 HTTP 状态码一一对应。
 - **可审计**：每次评估/变更留痕，含调用方、镜像指纹、策略版本、命中规则与结论依据。
+- **批量隔离**：批量/预演固定整批一份快照；单项坏输入只标记该项，不拖垮其他项；
+  批量上限 100 防止拖垮服务。
+- **预演无副作用**：候选规则仅存于请求内候选快照（版本标记 -1，配内容指纹），
+  与发布共用同一套规则校验器，但不写版本链；整次预演锚定单一当前版本，
+  并发发布/回滚下对照依然自洽，且同输入同策略结果可复现。

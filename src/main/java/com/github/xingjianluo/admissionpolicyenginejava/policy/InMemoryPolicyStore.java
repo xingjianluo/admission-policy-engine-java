@@ -7,8 +7,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -31,8 +29,14 @@ public class InMemoryPolicyStore implements PolicyStore {
     private static final Logger log = LoggerFactory.getLogger(InMemoryPolicyStore.class);
 
     private final CopyOnWriteArrayList<PolicySnapshot> versions = new CopyOnWriteArrayList<>();
+    private final PolicyRuleSetValidator validator;
 
     public InMemoryPolicyStore() {
+        this(new DefaultPolicyRuleSetValidator());
+    }
+
+    public InMemoryPolicyStore(PolicyRuleSetValidator validator) {
+        this.validator = validator;
         // v0：空策略基线，所有后续更新都基于它做乐观锁。
         versions.add(new PolicySnapshot(0L, Instant.now(), "system", "初始空策略基线", List.of()));
     }
@@ -65,7 +69,7 @@ public class InMemoryPolicyStore implements PolicyStore {
                                 + "但当前最新版本为 v" + head.version()
                                 + "，请重新读取后再提交");
             }
-            List<PolicyRule> validated = validateAndFreeze(rules);
+            List<PolicyRule> validated = validator.validateAndFreeze(rules);
             long nextVersion = head.version() + 1;
             PolicySnapshot snapshot = new PolicySnapshot(nextVersion, Instant.now(), by,
                     comment == null ? "" : comment, validated);
@@ -94,35 +98,5 @@ public class InMemoryPolicyStore implements PolicyStore {
     @Override
     public List<PolicySnapshot> history() {
         return List.copyOf(versions);
-    }
-
-    private List<PolicyRule> validateAndFreeze(List<PolicyRule> rules) {
-        List<PolicyRule> frozen = new ArrayList<>(rules.size());
-        HashSet<String> ids = new HashSet<>();
-        for (PolicyRule rule : rules) {
-            if (rule == null) {
-                throw new AdmissionException(ErrorCode.INVALID_REQUEST, "规则列表中不允许 null 条目");
-            }
-            if (rule.id() == null || rule.id().isBlank()) {
-                throw new AdmissionException(ErrorCode.INVALID_REQUEST, "规则缺少 id");
-            }
-            if (!ids.add(rule.id())) {
-                throw new AdmissionException(ErrorCode.INVALID_REQUEST,
-                        "规则 id 在同一版本内重复: " + rule.id());
-            }
-            if (rule.effect() == null) {
-                throw new AdmissionException(ErrorCode.INVALID_REQUEST,
-                        "规则 " + rule.id() + " 缺少 effect(ALLOW/DENY)");
-            }
-            if (rule.schemaVersion() < SUPPORTED_SCHEMA_MIN
-                    || rule.schemaVersion() > SUPPORTED_SCHEMA_MAX) {
-                throw new AdmissionException(ErrorCode.POLICY_SCHEMA_UNSUPPORTED,
-                        "规则 " + rule.id() + " 的 schemaVersion=" + rule.schemaVersion()
-                                + " 不在兼容范围 [" + SUPPORTED_SCHEMA_MIN + ", "
-                                + SUPPORTED_SCHEMA_MAX + "] 内");
-            }
-            frozen.add(rule);
-        }
-        return List.copyOf(frozen);
     }
 }

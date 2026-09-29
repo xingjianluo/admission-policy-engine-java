@@ -46,6 +46,28 @@ public final class WebDtos {
     public record RollbackRequest(CallerDto caller, Long targetVersion) {
     }
 
+    /** 批量操作中的单个镜像项（结构与单次 EvaluateRequest 的工件部分一致）。 */
+    public record BatchItemDto(
+            String reference,
+            List<ArtifactDto> artifacts
+    ) {
+    }
+
+    public record BatchEvaluateRequest(
+            String idempotencyKey,
+            CallerDto caller,
+            List<BatchItemDto> items
+    ) {
+    }
+
+    public record RehearseRequest(
+            String idempotencyKey,
+            CallerDto caller,
+            List<BatchItemDto> items,
+            List<RuleDto> candidateRules
+    ) {
+    }
+
     public record ApiError(String code, String message, String timestamp) {
     }
 }
