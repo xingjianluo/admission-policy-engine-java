@@ -85,12 +85,16 @@ public class DefaultBatchAdmissionService implements BatchAdmissionService {
         int allowed = 0;
         int denied = 0;
         int errors = 0;
+        int policyErrors = 0;
 
         for (BatchItemInput item : items) {
             BatchItemResult result = processOne(caller, item, snapshot, key);
             results.add(result);
             if (result.status() == ItemStatus.INPUT_ERROR) {
                 errors++;
+            } else if (result.status() == ItemStatus.POLICY_ERROR) {
+                // 现网历史坏规则：只标记本项，其余项照常出结论，整批不以 500 收场。
+                policyErrors++;
             } else if (result.report().decision() == Decision.ALLOW) {
                 allowed++;
             } else {
@@ -98,11 +102,12 @@ public class DefaultBatchAdmissionService implements BatchAdmissionService {
             }
         }
 
-        log.info("批量评估完成 caller={} size={} policyVersion=v{} allowed={} denied={} errors={} key={}",
-                caller.name(), items.size(), snapshot.version(), allowed, denied, errors, key);
+        log.info("批量评估完成 caller={} size={} policyVersion=v{} allowed={} denied={} errors={} policyErrors={} key={}",
+                caller.name(), items.size(), snapshot.version(), allowed, denied, errors,
+                policyErrors, key);
 
         return new BatchEvaluationReport(snapshot.version(), items.size(), allowed, denied,
-                errors, List.copyOf(results));
+                errors, policyErrors, List.copyOf(results));
     }
 
     private BatchItemResult processOne(Caller caller, BatchItemInput item,
@@ -134,17 +139,31 @@ public class DefaultBatchAdmissionService implements BatchAdmissionService {
 
         // 评估是对不可变快照的纯函数：跟随者即使重复计算也得到确定一致的结论，
         // 但只有占位者会写最终审计记录，因此同一批重复提交不会重复留痕。
-        DecisionReport report = evaluator.evaluate(descriptor, snapshot);
-        if (existing == null) {
-            auditService.complete(pending, new AuditRecord(auditId, pending.timestamp(),
-                    caller.name(), "BATCH_EVALUATE", descriptor.digest(), snapshot.version(),
-                    report.decision(), report.rationale(),
-                    "index=" + index + ",reference=" + descriptor.reference()
-                            + ",matched=" + report.matchedRules().stream()
-                            .map(m -> m.ruleId() + ":" + m.effect()).toList()));
+        try {
+            DecisionReport report = evaluator.evaluate(descriptor, snapshot);
+            if (existing == null) {
+                auditService.complete(pending, new AuditRecord(auditId, pending.timestamp(),
+                        caller.name(), "BATCH_EVALUATE", descriptor.digest(), snapshot.version(),
+                        report.decision(), report.rationale(),
+                        "index=" + index + ",reference=" + descriptor.reference()
+                                + ",matched=" + report.matchedRules().stream()
+                                .map(m -> m.ruleId() + ":" + m.effect()).toList()));
+            }
+            return new BatchItemResult(index, descriptor.reference(), ItemStatus.EVALUATED,
+                    report, null, null);
+        } catch (AdmissionException e) {
+            // 现网存在历史坏规则：本项给可定位的策略错误，不拖垮整批、不冒泡成 500。
+            if (existing == null) {
+                auditService.complete(pending, new AuditRecord(auditId, pending.timestamp(),
+                        caller.name(), "BATCH_EVALUATE_POLICY_ERROR", descriptor.digest(),
+                        snapshot.version(), null,
+                        "批量第 " + index + " 项因策略规则不合法无法评估[" + e.getCode()
+                                + "]: " + e.getMessage(),
+                        "index=" + index + ",reference=" + descriptor.reference()));
+            }
+            return recordPolicyError(caller, index, descriptor.reference(), e.getCode().name(),
+                    e.getMessage(), snapshot.version());
         }
-        return new BatchItemResult(index, descriptor.reference(), ItemStatus.EVALUATED,
-                report, null, null);
     }
 
     private BatchItemResult recordInputError(Caller caller, int index, String reference,
@@ -165,5 +184,20 @@ public class DefaultBatchAdmissionService implements BatchAdmissionService {
 
     private String referenceOf(BatchItemInput item) {
         return item.request() == null ? null : item.request().reference();
+    }
+
+    /** 历史坏规则导致单项无法评估：单独审计留痕，并以 POLICY_ERROR 返回该项。 */
+    private BatchItemResult recordPolicyError(Caller caller, int index, String reference,
+                                              String code, String message, long policyVersion) {
+        String auditId = "batch:" + IdempotencyIds.sha256Hex(
+                "BATCHPOLICYERR|" + caller.name() + "|v" + policyVersion
+                        + "|#" + index + "|" + code + "|" + reference);
+        auditService.record(new AuditRecord(auditId, Instant.now(), caller.name(),
+                "BATCH_EVALUATE_POLICY_ERROR", null, policyVersion, null,
+                "批量第 " + index + " 项策略规则不合法无法评估[" + code + "]: " + message,
+                "index=" + index + ",reference=" + reference));
+        log.warn("批量单项策略错误 index={} reference={} code={} message={}",
+                index, reference, code, message);
+        return new BatchItemResult(index, reference, ItemStatus.POLICY_ERROR, null, code, message);
     }
 }

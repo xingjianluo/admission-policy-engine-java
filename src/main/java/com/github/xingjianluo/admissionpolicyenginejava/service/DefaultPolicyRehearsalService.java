@@ -103,6 +103,7 @@ public class DefaultPolicyRehearsalService implements PolicyRehearsalService {
         int denyToAllow = 0;
         int unchanged = 0;
         int errors = 0;
+        int policyErrors = 0;
 
         for (BatchItemInput item : items) {
             RehearsalItemResult result = processOne(caller, item, current, candidateSnapshot,
@@ -110,6 +111,10 @@ public class DefaultPolicyRehearsalService implements PolicyRehearsalService {
             results.add(result);
             if (result.status() == ItemStatus.INPUT_ERROR) {
                 errors++;
+                continue;
+            }
+            if (result.status() == ItemStatus.POLICY_ERROR) {
+                policyErrors++;
                 continue;
             }
             switch (result.change()) {
@@ -120,12 +125,14 @@ public class DefaultPolicyRehearsalService implements PolicyRehearsalService {
         }
 
         log.info("策略预演完成 caller={} size={} currentVersion=v{} candidateFp={} "
-                        + "changed={} allowToDeny={} denyToAllow={} unchanged={} errors={} key={}",
+                        + "changed={} allowToDeny={} denyToAllow={} unchanged={} errors={} "
+                        + "policyErrors={} key={}",
                 caller.name(), items.size(), current.version(), candidateFingerprint,
-                changed, allowToDeny, denyToAllow, unchanged, errors, key);
+                changed, allowToDeny, denyToAllow, unchanged, errors, policyErrors, key);
 
         return new RehearsalReport(current.version(), candidateFingerprint, items.size(),
-                changed, allowToDeny, denyToAllow, unchanged, errors, List.copyOf(results));
+                changed, allowToDeny, denyToAllow, unchanged, errors, policyErrors,
+                List.copyOf(results));
     }
 
     private RehearsalItemResult processOne(Caller caller, BatchItemInput item,
@@ -147,8 +154,18 @@ public class DefaultPolicyRehearsalService implements PolicyRehearsalService {
         }
 
         // 双侧评估：同一份镜像，分别在现网快照与候选快照上判定。
-        DecisionReport currentReport = evaluator.evaluate(descriptor, current);
-        DecisionReport candidateReport = evaluator.evaluate(descriptor, candidate);
+        final DecisionReport currentReport;
+        final DecisionReport candidateReport;
+        try {
+            currentReport = evaluator.evaluate(descriptor, current);
+            candidateReport = evaluator.evaluate(descriptor, candidate);
+        } catch (AdmissionException e) {
+            // 现网历史坏规则（候选已在预演开始前整体校验通过）：本项不给对照结论，
+            // 标记 POLICY_ERROR，其余项照常，整次预演不冒泡成 500。
+            return recordPolicyError(caller, index, descriptor.reference(),
+                    e.getCode().name(), e.getMessage(), current.version(),
+                    candidateFingerprint);
+        }
         ChangeDirection change = directionOf(currentReport.decision(), candidateReport.decision());
 
         String auditId = "rehe:" + IdempotencyIds.sha256Hex(
@@ -193,6 +210,28 @@ public class DefaultPolicyRehearsalService implements PolicyRehearsalService {
         log.info("预演单项输入错误 index={} reference={} code={} message={}",
                 index, reference, code, message);
         return new RehearsalItemResult(index, reference, ItemStatus.INPUT_ERROR, null, null,
+                null, code, message);
+    }
+
+    private RehearsalItemResult recordPolicyError(Caller caller, int index, String reference,
+                                                  String code, String message,
+                                                  long currentVersion,
+                                                  String candidateFingerprint) {
+        String anchor = reference == null ? "#" + index : reference;
+        String auditId = "rehe:" + IdempotencyIds.sha256Hex(
+                "REHEARSEPOLICYERR|" + caller.name() + "|v" + currentVersion
+                        + "|cand=" + candidateFingerprint + "|#" + index + "|" + code
+                        + "|" + anchor);
+        auditService.record(new AuditRecord(auditId, Instant.now(), caller.name(),
+                "POLICY_REHEARSE_POLICY_ERROR", null, currentVersion, null,
+                "预演第 " + index + " 项因现网策略规则不合法无法对照[" + code + "]: "
+                        + message,
+                "index=" + index + ",reference=" + reference
+                        + ",candidateFp=" + candidateFingerprint));
+        log.warn("预演单项策略错误 index={} reference={} code={} message={}",
+                index, reference, code, message);
+        // 不返回任何对照结论（双侧报告均为 null，change 为 null）。
+        return new RehearsalItemResult(index, reference, ItemStatus.POLICY_ERROR, null, null,
                 null, code, message);
     }
 

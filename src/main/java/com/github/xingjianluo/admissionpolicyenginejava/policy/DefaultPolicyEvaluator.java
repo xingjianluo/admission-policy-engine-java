@@ -1,5 +1,7 @@
 package com.github.xingjianluo.admissionpolicyenginejava.policy;
 
+import com.github.xingjianluo.admissionpolicyenginejava.error.AdmissionException;
+import com.github.xingjianluo.admissionpolicyenginejava.error.ErrorCode;
 import com.github.xingjianluo.admissionpolicyenginejava.model.Decision;
 import com.github.xingjianluo.admissionpolicyenginejava.model.DecisionReport;
 import com.github.xingjianluo.admissionpolicyenginejava.model.ImageDescriptor;
@@ -48,7 +50,26 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
     public DecisionReport evaluate(ImageDescriptor d, PolicySnapshot snapshot) {
         List<MatchedRule> matched = new ArrayList<>();
         for (PolicyRule rule : snapshot.rules()) {
-            List<String> facts = matchConditions(rule, d);
+            // 失败边界：历史坏规则（发布校验完善前已存在的非法条件参数）在匹配时
+            // 可能抛出参数解析异常或 NPE，这里统一转成可定位的 POLICY_RULESET_INVALID，
+            // 绝不以 500 冒泡；调用方（单镜像/批量/预演）据此给出可判断的反馈。
+            final List<String> facts;
+            try {
+                // 先用与发布/预演入口相同的规约检查本规则参数：即使某坏参数在本镜像上
+                // “恰好不抛异常”（如 REGISTRY_EQUALS 缺参会静默不匹配），也必须被确定性地
+                // 识别出来，而不是让坏规则继续在线上版本里沉默。
+                for (PolicyCondition c : rule.conditions()) {
+                    if (c == null) {
+                        throw new IllegalArgumentException("条件条目为 null");
+                    }
+                    ConditionParameters.validate(c.type(), c.value());
+                }
+                facts = matchConditions(rule, d);
+            } catch (AdmissionException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw invalidRule(rule, snapshot, e);
+            }
             if (facts.size() == rule.conditions().size()) {
                 String reason = rule.conditions().isEmpty()
                         ? "无条件规则，匹配任意镜像"
@@ -108,7 +129,7 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
         String v = c.value();
         return switch (c.type()) {
             case SEVERITY_AT_LEAST -> {
-                Severity threshold = parseSeverity(v);
+                Severity threshold = parseSeverity(c);
                 List<Vulnerability> hits = d.vulnerabilities().stream()
                         .filter(x -> x.severity().ordinal() >= threshold.ordinal()).toList();
                 yield hits.isEmpty() ? null
@@ -147,14 +168,30 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
         return expected != null && expected.equals(actual);
     }
 
-    private Severity parseSeverity(String name) {
-        if (name == null) {
-            throw new IllegalArgumentException("SEVERITY_AT_LEAST 条件缺少 value");
-        }
+    /**
+     * 解析严重级别阈值：与发布/预演入口共用 {@link ConditionParameters} 的取值规约，
+     * 允许大小写与首尾空格差异，非法值抛出可定位异常。
+     */
+    private Severity parseSeverity(PolicyCondition c) {
         try {
-            return Severity.valueOf(name.trim().toUpperCase());
+            return ConditionParameters.parseSeverity(c.type(), c.value());
         } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("无法识别的严重级别: " + name);
+            throw new IllegalArgumentException(
+                    "SEVERITY_AT_LEAST 条件参数非法: " + e.getMessage());
         }
+    }
+
+    /**
+     * 把匹配期间暴露出来的历史坏规则问题统一包装为 POLICY_RULESET_INVALID，
+     * 消息中带上策略版本、规则 id 与根因，方便调用方定位“是哪条已生效规则坏了”。
+     */
+    private AdmissionException invalidRule(PolicyRule rule, PolicySnapshot snapshot,
+                                           RuntimeException cause) {
+        String message = "策略版本 v" + snapshot.version() + " 中规则 " + rule.id()
+                + " 的条件参数非法，无法完成评估（属历史坏规则，请修正后重新发布）: "
+                + cause.getMessage();
+        log.warn("评估遇到历史坏规则 policyVersion=v{} rule={} cause={}",
+                snapshot.version(), rule.id(), cause.getMessage());
+        return new AdmissionException(ErrorCode.POLICY_RULESET_INVALID, message, cause);
     }
 }

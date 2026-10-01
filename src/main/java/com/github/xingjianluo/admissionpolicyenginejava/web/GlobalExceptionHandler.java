@@ -20,7 +20,8 @@ import java.time.Instant;
  *   <li>401：{@link ErrorCode#UNAUTHORIZED}（鉴权拒绝，与策略 DENY 区分）；</li>
  *   <li>409：{@link ErrorCode#POLICY_VERSION_CONFLICT}（并发更新冲突）；</li>
  *   <li>404：{@link ErrorCode#POLICY_VERSION_NOT_FOUND}；</li>
- *   <li>422：输入/格式/指纹/schema 类可归类错误（注意：这不是策略 DENY）；</li>
+ *   <li>422：输入/格式/指纹/schema 类可归类错误，以及
+ *       {@link ErrorCode#POLICY_RULESET_INVALID}（规则集不合法，注意：这不是策略 DENY）；</li>
  *   <li>400：请求本身不合法。</li>
  * </ul>
  * 注意：策略判定为 DENY 是正常 200 响应体内的 decision 字段，不会走异常通道。
@@ -37,6 +38,7 @@ public class GlobalExceptionHandler {
             case POLICY_VERSION_CONFLICT -> HttpStatus.CONFLICT;
             case POLICY_VERSION_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case INVALID_REQUEST -> HttpStatus.BAD_REQUEST;
+            case POLICY_RULESET_INVALID -> HttpStatus.UNPROCESSABLE_ENTITY;
             default -> HttpStatus.UNPROCESSABLE_ENTITY;
         };
         log.warn("请求被拒绝 httpStatus={} errorCode={} message={}",
