@@ -17,6 +17,7 @@ import java.util.List;
  * @param denyToAllowCount     拒绝变放行的条目数
  * @param unchangedCount       结论不变的条目数
  * @param errorCount           输入非法条目数
+ * @param policyErrorCount     现网策略版本含历史坏规则、无法给出对照结论的条目数
  * @param items                逐项双侧对照结果
  */
 public record RehearsalReport(
@@ -28,6 +29,7 @@ public record RehearsalReport(
         int denyToAllowCount,
         int unchangedCount,
         int errorCount,
+        int policyErrorCount,
         List<RehearsalItemResult> items
 ) {
 }

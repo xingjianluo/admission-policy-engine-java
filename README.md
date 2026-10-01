@@ -11,6 +11,7 @@
 - 审计按幂等键去重，并发/重复提交只产生一条记录
 - **批量评估**：一批镜像逐项出结论，单项坏输入只标记该项不拖垮整批，批量有明确上限
 - **策略预演**：用候选规则对同一批镜像给“现网 vs 候选”双侧对照，**不发布、不产生正式版本**
+- **规则集参数强校验**：发布与预演共用同一套条件参数校验，严重级别档位/必填参数不合法整份按 **422 POLICY_RULESET_INVALID** 拒绝，不发布、不留版本、不留成功审计；历史坏规则在单镜像/批量/预演均以可定位错误失败而非 500
 
 ---
 
@@ -82,6 +83,7 @@
 | `UNAUTHORIZED` | **鉴权**拒绝（与策略拒绝无关） | 401 |
 | `POLICY_VERSION_CONFLICT` | 乐观锁：提交基于的版本已过期 | 409 |
 | `POLICY_SCHEMA_UNSUPPORTED` | 规则 schemaVersion 越界 | 422 |
+| `POLICY_RULESET_INVALID` | 规则集不合法：条件参数缺失/格式错误/严重级别档位不在 LOW/MEDIUM/HIGH/CRITICAL（发布与预演同规拒绝） | 422 |
 | `POLICY_VERSION_NOT_FOUND` | 回滚/读取的版本不存在 | 404 |
 
 > 关键区分：**输入合法但策略不允许** → 响应体 `decision=DENY`（HTTP 200）；
@@ -150,13 +152,30 @@ vulnerability.package.2=curl
 
 | 条件类型 | value | 何时匹配 |
 |---|---|---|
-| `SEVERITY_AT_LEAST` | `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` | 存在严重级别 ≥ 阈值的漏洞 |
-| `REGISTRY_EQUALS` / `REGISTRY_NOT_EQUALS` | registry 主机 | registry 等于 / 不等于 |
-| `REPOSITORY_PREFIX` | 路径前缀 | repository 前缀匹配 |
-| `PROVENANCE_PRESENT` / `PROVENANCE_MISSING` | — | 证明存在 / 缺失 |
-| `SIGNATURE_VERIFIED` / `SIGNATURE_NOT_VERIFIED` | — | 签名存在且通过 / 无签名或未通过 |
-| `BUILDER_ID_EQUALS` | builderId | `provenance.builder.id` 等于 |
-| `SOURCE_URI_PREFIX` | URI 前缀 | `provenance.sourceUri` 前缀匹配 |
+| `SEVERITY_AT_LEAST` | `LOW`/`MEDIUM`/`HIGH`/`CRITICAL`（**必填**，大小写与首尾空格不敏感） | 存在严重级别 ≥ 阈值的漏洞 |
+| `REGISTRY_EQUALS` / `REGISTRY_NOT_EQUALS` | registry 主机（**必填**，非空白；匹配大小写敏感） | registry 等于 / 不等于 |
+| `REPOSITORY_PREFIX` | 路径前缀（**必填**，非空白） | repository 前缀匹配 |
+| `PROVENANCE_PRESENT` / `PROVENANCE_MISSING` | 无参数（忽略误填的 value） | 证明存在 / 缺失 |
+| `SIGNATURE_VERIFIED` / `SIGNATURE_NOT_VERIFIED` | 无参数（忽略误填的 value） | 签名存在且通过 / 无签名或未通过 |
+| `BUILDER_ID_EQUALS` | builderId（**必填**，非空白） | `provenance.builder.id` 等于 |
+| `SOURCE_URI_PREFIX` | URI 前缀（**必填**，非空白） | `provenance.sourceUri` 前缀匹配 |
+
+#### 条件参数取值要求（发布与预演共用同一套校验）
+
+- **参数归一化**：所有字符串参数先 `trim()`；`SEVERITY_AT_LEAST` 阈值还会转大写。
+  因此 `"high"`、`" High "` 与 `HIGH` 等价；`"  gcr.internal  "` 归一化为 `gcr.internal`。
+  归一化**只在校验通过后**发生，非法输入永远不会被静默改写后放行。
+- **严重级别阈值**：仅允许 `LOW` / `MEDIUM` / `HIGH` / `CRITICAL` 四档。
+  - 写成其它词（如 `URGENT`）、留空（`null` / `""` / 纯空白）、或写成 `UNKNOWN`
+    （`UNKNOWN` 是扫描器未能定级的占位值，**不允许**作为策略档位）都判为规则集不合法。
+- **必填参数条件**：`SEVERITY_AT_LEAST`、`REGISTRY_EQUALS`、`REGISTRY_NOT_EQUALS`、
+  `REPOSITORY_PREFIX`、`BUILDER_ID_EQUALS`、`SOURCE_URI_PREFIX` 的 value 必填且不能为空白；
+  缺失或纯空白判为规则集不合法。
+- **无参条件**：`PROVENANCE_PRESENT/MISSING`、`SIGNATURE_VERIFIED/NOT_VERIFIED` 不需要参数，
+  即使误填 value 也会被忽略并归一化为 `null`，不影响匹配。
+- **整批拒绝**：一份规则集里只要有**任意一条**规则的条件参数不合法，整份规则集都按
+  **422 `POLICY_RULESET_INVALID`（规则集不合法）**拒绝，不会发布成功、不会写进线上生效策略、
+  不产生新版本、也不记成一次成功发布。
 
 ### 优先级与冲突裁决（确定性、可复现）
 
@@ -360,14 +379,63 @@ vulnerability.package.2=curl
   同一份候选（指纹相同），重复预演任意次结果完全一致。
 - 批量上限、单项坏输入隔离规则与批量评估相同（上限 100）。
 
-### 7.3 鉴权、审计与幂等
+### 7.3 条件参数不合法：发布与预演如何返回（规则集不合法）
+
+发布（`POST /policies/update`）与预演（`POST /admission/rehearse`）对规则参数使用
+**完全相同**的校验（`PolicyRuleSetValidator`，见第 3 节“条件参数取值要求”）。
+
+- **发布**：规则集里任意一条规则的条件参数不合法（严重级别档位不在
+  `LOW/MEDIUM/HIGH/CRITICAL`、必填参数缺失或为空白、参数格式错误），整份规则集被拒绝，
+  返回 **HTTP 422**、错误体 `code=POLICY_RULESET_INVALID`、`message` 精确定位到
+  “规则 id + 条件类型 + 原因”。该请求：
+  - 不返回发布成功、**不写进线上生效策略**；
+  - 当前策略版本与版本历史（`/history`）**保持原样**，不留下新版本（版本号不 +1）；
+  - 不写 `POLICY_UPDATE` 成功审计（不会把被拒请求记成一次成功发布）。
+- **预演**：候选规则在**评估开始前**先过同一套校验。同样的非法候选规则会被**整批拒绝**，
+  返回 **HTTP 422** `POLICY_RULESET_INVALID`：
+  - 不会跑到评估阶段才以 500 失败；
+  - **不返回任何对照结论**（没有 `RehearsalReport`、没有逐项 current/candidate 结果）；
+  - 不改动线上策略、不产生正式版本，也不留任何预演审计记录；
+  - 仅当候选规则全部合法时，才会进入逐项双侧对照。
+- **三种“拒绝”严格区分**：
+
+  | 情形 | 通道 | 形态 |
+  |---|---|---|
+  | 规则集不合法（本次修复） | **422 `POLICY_RULESET_INVALID`** | 请求被拒，无版本/无结论 |
+  | 策略结论是拒绝 | **HTTP 200**，响应体 `decision=DENY` | 正常评估结论，`decisiveRule` 可查 |
+  | 未授权 | **401 `UNAUTHORIZED`** | 鉴权通道，根本不进入规则校验/评估 |
+
+  注意乐观锁冲突是另一条独立通道 **409 `POLICY_VERSION_CONFLICT`**，与规则内容是否合法无关。
+
+### 7.4 历史坏规则的失败边界（评估不 500）
+
+理论上发布/预演前置校验已经拦住新提交的坏规则；但若线上因历史操作已存在带非法条件参数
+的规则版本（例如早期版本写入的 `SEVERITY_AT_LEAST=URGENT` 或必填参数为 null），
+评估链路也**不会再以 500 失败**，而是给出可判断、可定位（含策略版本号 vN 与规则 id）的失败：
+
+- **单镜像评估** `POST /admission/evaluate`：返回 **422 `POLICY_RULESET_INVALID`**，
+  消息形如“线上策略版本 vN 中规则 X 的条件参数不合法……请修复或回滚策略”；
+  审计占位会被释放（不会把同一幂等键永久卡在“进行中”）。
+- **批量评估**：整批不 500。对受影响的每一项返回 `status=POLICY_ERROR`、
+  `errorCode=POLICY_RULESET_INVALID`、可定位的 `errorMessage`，且该项 `report=null`；
+  这些项计入汇总 `errorCount`，`allowedCount/deniedCount` 只统计真正出结论的项。
+  （输入本身有问题的项仍是 `INPUT_ERROR`，两者可区分。）
+- **预演**：若**现网一侧**策略版本含历史坏规则，受影响项返回 `status=POLICY_ERROR`，
+  **不返回 currentReport/candidateReport/change**（不给任何对照结论），计入报告新增字段
+  `policyErrorCount`，并留 `POLICY_REHEARSE_POLICY_ERROR` 审计。
+  注意：**候选侧**坏规则在预演开始前即被 7.3 的整批拒绝拦住，不会走到逐项阶段。
+
+> 处置建议：出现 POLICY_ERROR 说明线上某个版本不可用于评估，应发布一份合法规则集
+> 或 `POST /policies/rollback` 回滚到已知良好版本（回滚本身会产生一个内容良好的新版本）。
+
+### 7.5 鉴权、审计与幂等
 
 - 两个接口都需要 **`EVALUATE`** 权限（READER/AUDITOR/ADMIN）。未授权 →
   **401 `UNAUTHORIZED`**，这与“项内策略结论 DENY（HTTP 200）”是**不同通道**，
   不会把“没权限”误读成“策略不许过”。
 - 审计新增动作（`/api/audit/...` 可查）：
-  - `BATCH_EVALUATE` / `BATCH_EVALUATE_INPUT_ERROR`
-  - `POLICY_REHEARSE` / `POLICY_REHEARSE_INPUT_ERROR`
+  - `BATCH_EVALUATE` / `BATCH_EVALUATE_INPUT_ERROR` / `BATCH_EVALUATE_POLICY_ERROR`
+  - `POLICY_REHEARSE` / `POLICY_REHEARSE_INPUT_ERROR` / `POLICY_REHEARSE_POLICY_ERROR`
 
   记录含**谁（caller）、什么时候（timestamp）、对哪个镜像（imageDigest）、
   用的哪份策略（现网 `policyVersion` + `candidateFingerprint`）、双侧决定性规则与结论**。
@@ -375,8 +443,6 @@ vulnerability.package.2=curl
   `动作 | caller | 现网版本 | 候选指纹(预演) | 整批 idempotencyKey | 下标 | 镜像指纹` 派生。
   **同一批请求用相同 `idempotencyKey` 重复提交，不产生重复审计记录**，结论仍稳定返回；
   不同 `idempotencyKey` 视为不同批次，分别留痕。
-
----
 
 ---
 
@@ -388,8 +454,8 @@ vulnerability.package.2=curl
 mvn test
 ```
 
-46 个测试，覆盖原有四类关键场景与新增的批量/预演场景，且单测日志中打印
-**评估输入、命中的策略与最终判定依据**：
+59 个测试，覆盖原有四类关键场景、批量/预演场景以及本次“规则集不合法”修复，
+且单测日志中打印**评估输入、命中的策略与最终判定依据**：
 
 | 测试类 | 数量 | 覆盖内容 |
 |---|---|---|
@@ -401,8 +467,10 @@ mvn test
 | `BatchEvaluationIntegrationTest` | 5 | 批量逐项结论与汇总、坏输入只标记该项不影响其他项、空批/超 100 上限拒绝、未授权 401、重复批次不重复留痕 |
 | `PolicyRehearsalIntegrationTest` | 8 | 双侧对照与变化方向/决定性规则、预演不发布不留版本、非法候选与发布同规拒绝、6 次重复可复现、坏输入隔离、未授权、重复预演幂等、ALLOW→DENY 方向 |
 | `RehearsalConcurrencyIntegrationTest` | 1 | 预演期间管理员持续发布/回滚，6 线程×30 轮×5 项（900 个逐项校验）两侧结论始终锚定同一份当前快照，不出现新旧混合 |
+| `ConditionParameterValidationTest` | 5 | 非法档位（含 UNKNOWN/空值）拒绝、必填条件缺参拒绝、合法大小写/空格变体归一化通过、历史坏档位/缺参规则在评估器以可区分错误失败而非 500 |
+| `RuleSetInvalidIntegrationTest` | 8 | 非法档位/缺参在发布与预演两入口均按 POLICY_RULESET_INVALID 拒绝、版本与历史不变且不留成功审计、拒绝的预演无对照结论、与 DENY/401 区分、合法变体两入口通过、历史坏规则下单镜像 422 / 批量逐项 POLICY_ERROR / 预演无对照 |
 
-> 新增功能不改变既有单镜像评估、发布/回滚与审计行为：原有 32 个用例全部不回归。
+> 本次修复不改变既有单镜像评估、批量评估、预演、发布/回滚与审计行为：原有 46 个用例全部不回归（新增 13 个用例，合计 59）。
 
 查看带输入/命中规则/判定依据的详细日志：
 
@@ -453,6 +521,7 @@ curl -s -X POST http://localhost:8099/api/policies/rollback \
 - 工件 digest 与清单不一致 → **422 FINGERPRINT_MISMATCH**
 - 两个并发更新同基于 v1 → 第一个 200(v2)，第二个 **409 POLICY_VERSION_CONFLICT**
 - `schemaVersion=99` → **422 POLICY_SCHEMA_UNSUPPORTED**（提示兼容范围 [1,2]）
+- 严重级别档位写成 `URGENT` 或必填条件 value 留空 → **422 POLICY_RULESET_INVALID**（规则集不合法，版本/历史不变）
 - 相同 `idempotencyKey` 提交两次 → 审计记录仅 +1
 
 ### 手工验证批量评估与预演
@@ -493,6 +562,54 @@ curl -s "http://localhost:8099/api/audit/by-digest?digest=sha256:smk0001" -H "X-
 
 ---
 
+### 手工复现“规则集不合法”修复（发布 / 预演 / 历史坏规则）
+
+```bash
+# 1) 发布非法档位：SEVERITY_AT_LEAST=URGENT -> 422 POLICY_RULESET_INVALID，
+#    随后查 current/history，版本与历史长度都不变（没有新版本）。
+curl -s -i -X POST http://localhost:8099/api/policies/update \
+  -H "Content-Type: application/json" -d '{
+    "caller":{"name":"root","roles":["ADMIN"]},"expectedBaseVersion":1,"comment":"bad",
+    "rules":[{"id":"bad-sev","priority":10,"effect":"DENY","schemaVersion":1,
+      "conditions":[{"type":"SEVERITY_AT_LEAST","value":"URGENT"}]}]}'
+
+curl -s http://localhost:8099/api/policies/current -H "X-Caller: root|ADMIN"
+curl -s http://localhost:8099/api/policies/history -H "X-Caller: root|ADMIN"
+
+# 2) 需要参数的条件缺参数（REGISTRY_EQUALS 不给 value）-> 同样 422 POLICY_RULESET_INVALID
+curl -s -i -X POST http://localhost:8099/api/policies/update \
+  -H "Content-Type: application/json" -d '{
+    "caller":{"name":"root","roles":["ADMIN"]},"expectedBaseVersion":1,"comment":"missing",
+    "rules":[{"id":"no-val","priority":10,"effect":"DENY","schemaVersion":1,
+      "conditions":[{"type":"REGISTRY_EQUALS"}]}]}'
+
+# 3) 合法变体（小写+首尾空格）应发布成功并归一化为 HIGH
+curl -s -X POST http://localhost:8099/api/policies/update \
+  -H "Content-Type: application/json" -d '{
+    "caller":{"name":"root","roles":["ADMIN"]},"expectedBaseVersion":1,"comment":"ok-variant",
+    "rules":[{"id":"ok-sev","priority":10,"effect":"DENY","schemaVersion":1,
+      "conditions":[{"type":"SEVERITY_AT_LEAST","value":" high "]}]}]'
+curl -s -X POST http://localhost:8099/api/policies/rollback \
+  -H "Content-Type: application/json" \
+  -d '{"caller":{"name":"root","roles":["ADMIN"]},"targetVersion":1}'
+
+# 4) 预演非法候选：在评估前整批 422，响应体不是 RehearsalReport（无任何对照结论）
+curl -s -i -X POST http://localhost:8099/api/admission/rehearse \
+  -H "Content-Type: application/json" -d '{
+    "idempotencyKey":"smoke-rehe-bad","caller":{"name":"reader-1","roles":["READER"]},
+    "items":[{"reference":"gcr.internal/x:1","artifacts":[
+        {"kind":"MANIFEST","format":"OCI-MANIFEST","content":"{\"digest\":\"sha256:smk0001\",\"config\":{\"digest\":\"sha256:smk0001\"}}"},
+        {"kind":"VULN_SCAN","format":"CYCLONEDX-JSON","content":"{\"digest\":\"sha256:smk0001\",\"vulnerabilities\":[]}"}]}],
+    "candidateRules":[{"id":"bad","priority":1,"effect":"DENY","schemaVersion":1,
+      "conditions":[{"type":"SEVERITY_AT_LEAST","value":""}]}]}'
+```
+
+自动化验证（无需起服务，覆盖发布/预演两入口拒绝、版本历史不变、合法变体通过、历史坏规则失败边界）：
+
+```bash
+mvn -Dtest=ConditionParameterValidationTest,RuleSetInvalidIntegrationTest test
+```
+
 ## 9. 设计要点小结
 
 - **一致性**：快照不可变 + 评估前固定引用 + 版本链读无锁，更新/回滚与评估完全隔离。
@@ -503,6 +620,7 @@ curl -s "http://localhost:8099/api/audit/by-digest?digest=sha256:smk0001" -H "X-
 - **可审计**：每次评估/变更留痕，含调用方、镜像指纹、策略版本、命中规则与结论依据。
 - **批量隔离**：批量/预演固定整批一份快照；单项坏输入只标记该项，不拖垮其他项；
   批量上限 100 防止拖垮服务。
+- **规则集强校验与失败边界**：条件参数取值要求集中在 ConditionParameters，发布与预演共用同一校验器，坏规则在入口即整批 422 拒绝（不写版本链/不留成功审计）；评估器对存量历史坏规则二次识别，单镜像返回 422、批量逐项 POLICY_ERROR、预演逐项 POLICY_ERROR 且无对照，杜绝 500。
 - **预演无副作用**：候选规则仅存于请求内候选快照（版本标记 -1，配内容指纹），
   与发布共用同一套规则校验器，但不写版本链；整次预演锚定单一当前版本，
   并发发布/回滚下对照依然自洽，且同输入同策略结果可复现。

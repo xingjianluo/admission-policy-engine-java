@@ -9,8 +9,9 @@ import java.util.List;
 public interface PolicyRuleSetValidator {
 
     /**
-     * 校验并冻结规则集（null、空集、重复 id、缺 effect、schemaVersion 越界等
-     * 均抛 AdmissionException）。
+     * 校验并冻结规则集（null、空集、重复 id、缺 effect、schemaVersion 越界、
+     * 条件缺参数/参数格式错误/严重级别档位不允许等均抛 AdmissionException）。
+     * 通过后条件参数按规约归一化（trim；SEVERITY_AT_LEAST 转大写）。
      *
      * @return 不可变的规则列表
      */

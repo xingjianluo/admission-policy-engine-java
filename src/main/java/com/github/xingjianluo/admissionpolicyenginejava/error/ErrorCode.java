@@ -20,6 +20,8 @@ public enum ErrorCode {
     POLICY_VERSION_CONFLICT,
     /** 策略规则的 schemaVersion 不在本引擎兼容范围内。 */
     POLICY_SCHEMA_UNSUPPORTED,
+    /** 规则集本身不合法（条件参数缺失/格式错误/取值不允许等），发布与预演同规拒绝。 */
+    POLICY_RULESET_INVALID,
     /** 回dump目标版本不存在。 */
     POLICY_VERSION_NOT_FOUND,
     /** 请求参数本身不合法。 */

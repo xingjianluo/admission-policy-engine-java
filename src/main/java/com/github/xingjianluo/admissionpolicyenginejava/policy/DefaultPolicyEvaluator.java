@@ -1,5 +1,7 @@
 package com.github.xingjianluo.admissionpolicyenginejava.policy;
 
+import com.github.xingjianluo.admissionpolicyenginejava.error.AdmissionException;
+import com.github.xingjianluo.admissionpolicyenginejava.error.ErrorCode;
 import com.github.xingjianluo.admissionpolicyenginejava.model.Decision;
 import com.github.xingjianluo.admissionpolicyenginejava.model.DecisionReport;
 import com.github.xingjianluo.admissionpolicyenginejava.model.ImageDescriptor;
@@ -48,7 +50,7 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
     public DecisionReport evaluate(ImageDescriptor d, PolicySnapshot snapshot) {
         List<MatchedRule> matched = new ArrayList<>();
         for (PolicyRule rule : snapshot.rules()) {
-            List<String> facts = matchConditions(rule, d);
+            List<String> facts = matchConditions(rule, d, snapshot.version());
             if (facts.size() == rule.conditions().size()) {
                 String reason = rule.conditions().isEmpty()
                         ? "无条件规则，匹配任意镜像"
@@ -93,22 +95,42 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
     /**
      * 返回全部已满足条件的事实说明；调用方以“返回数量 == 条件数量”判定规则是否命中。
      */
-    private List<String> matchConditions(PolicyRule rule, ImageDescriptor d) {
+    private List<String> matchConditions(PolicyRule rule, ImageDescriptor d, long policyVersion) {
         List<String> facts = new ArrayList<>();
         for (PolicyCondition c : rule.conditions()) {
-            String fact = matchOne(c, d);
-            if (fact != null) {
-                facts.add(fact);
+            try {
+                String fact = matchOne(rule.id(), c, d, policyVersion);
+                if (fact != null) {
+                    facts.add(fact);
+                }
+            } catch (AdmissionException e) {
+                if (e.getCode() == ErrorCode.POLICY_RULESET_INVALID) {
+                    // 统一给历史坏规则错误补上策略版本，保证单镜像/批量/预演都能据此定位坏版本。
+                    throw new AdmissionException(ErrorCode.POLICY_RULESET_INVALID,
+                            "线上策略版本 v" + policyVersion + " 中规则 " + rule.id()
+                                    + " 的条件参数不合法（" + e.getMessage() + "），"
+                                    + "该规则版本不可用于评估，请修复或回滚策略", e);
+                }
+                throw e;
             }
         }
         return facts;
     }
 
-    private String matchOne(PolicyCondition c, ImageDescriptor d) {
+    private String matchOne(String ruleId, PolicyCondition c, ImageDescriptor d,
+                            long policyVersion) {
         String v = c.value();
+        // 失败边界：历史上可能已存在绕过校验发布的坏规则（缺参数/格式错误）。
+        // 评估期再次识别，以可区分的规则集不合法错误失败，而不是 IllegalArgumentException/NPE → 500。
+        if (ConditionParameters.requiresValue(c.type()) && (v == null || v.isBlank())) {
+            throw new AdmissionException(ErrorCode.POLICY_RULESET_INVALID,
+                    "线上策略版本 v" + policyVersion + " 中规则 " + ruleId + " 的条件 "
+                            + c.type() + " 缺少合法参数 value，该规则版本不可用于评估，"
+                            + "请修复或回滚策略");
+        }
         return switch (c.type()) {
             case SEVERITY_AT_LEAST -> {
-                Severity threshold = parseSeverity(v);
+                Severity threshold = ConditionParameters.normalizeSeverity(v, ruleId);
                 List<Vulnerability> hits = d.vulnerabilities().stream()
                         .filter(x -> x.severity().ordinal() >= threshold.ordinal()).toList();
                 yield hits.isEmpty() ? null
@@ -145,16 +167,5 @@ public class DefaultPolicyEvaluator implements PolicyEvaluator {
 
     private boolean safeEquals(String expected, String actual) {
         return expected != null && expected.equals(actual);
-    }
-
-    private Severity parseSeverity(String name) {
-        if (name == null) {
-            throw new IllegalArgumentException("SEVERITY_AT_LEAST 条件缺少 value");
-        }
-        try {
-            return Severity.valueOf(name.trim().toUpperCase());
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("无法识别的严重级别: " + name);
-        }
     }
 }

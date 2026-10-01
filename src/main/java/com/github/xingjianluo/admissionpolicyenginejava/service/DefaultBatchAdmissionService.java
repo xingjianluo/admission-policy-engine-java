@@ -89,12 +89,14 @@ public class DefaultBatchAdmissionService implements BatchAdmissionService {
         for (BatchItemInput item : items) {
             BatchItemResult result = processOne(caller, item, snapshot, key);
             results.add(result);
-            if (result.status() == ItemStatus.INPUT_ERROR) {
-                errors++;
-            } else if (result.report().decision() == Decision.ALLOW) {
+            if (result.status() == ItemStatus.EVALUATED
+                    && result.report().decision() == Decision.ALLOW) {
                 allowed++;
-            } else {
+            } else if (result.status() == ItemStatus.EVALUATED) {
                 denied++;
+            } else {
+                // INPUT_ERROR 与 POLICY_ERROR 都是“未给出策略结论”的项，计入 errors。
+                errors++;
             }
         }
 
@@ -134,17 +136,38 @@ public class DefaultBatchAdmissionService implements BatchAdmissionService {
 
         // 评估是对不可变快照的纯函数：跟随者即使重复计算也得到确定一致的结论，
         // 但只有占位者会写最终审计记录，因此同一批重复提交不会重复留痕。
-        DecisionReport report = evaluator.evaluate(descriptor, snapshot);
-        if (existing == null) {
-            auditService.complete(pending, new AuditRecord(auditId, pending.timestamp(),
-                    caller.name(), "BATCH_EVALUATE", descriptor.digest(), snapshot.version(),
-                    report.decision(), report.rationale(),
-                    "index=" + index + ",reference=" + descriptor.reference()
-                            + ",matched=" + report.matchedRules().stream()
-                            .map(m -> m.ruleId() + ":" + m.effect()).toList()));
+        try {
+            DecisionReport report = evaluator.evaluate(descriptor, snapshot);
+            if (existing == null) {
+                auditService.complete(pending, new AuditRecord(auditId, pending.timestamp(),
+                        caller.name(), "BATCH_EVALUATE", descriptor.digest(), snapshot.version(),
+                        report.decision(), report.rationale(),
+                        "index=" + index + ",reference=" + descriptor.reference()
+                                + ",matched=" + report.matchedRules().stream()
+                                .map(m -> m.ruleId() + ":" + m.effect()).toList()));
+            }
+            return new BatchItemResult(index, descriptor.reference(), ItemStatus.EVALUATED,
+                    report, null, null);
+        } catch (AdmissionException e) {
+            if (e.getCode() != ErrorCode.POLICY_RULESET_INVALID) {
+                throw e;
+            }
+            // 失败边界：现网策略版本含历史坏规则时，每个项都得到可定位的 POLICY_ERROR，
+            // 整批不以 500 收场；同时释放审计占位，避免幂等键卡在“进行中”。
+            if (existing == null) {
+                auditService.complete(pending, new AuditRecord(auditId, pending.timestamp(),
+                        caller.name(), "BATCH_EVALUATE_POLICY_ERROR", descriptor.digest(),
+                        snapshot.version(), null,
+                        "批量第 " + index + " 项无法评估（现网策略版本含非法规则）: "
+                                + e.getMessage(),
+                        "index=" + index + ",reference=" + descriptor.reference()
+                                + ",errorCode=" + e.getCode()));
+            }
+            log.warn("批量单项策略错误 index={} reference={} code={} message={}",
+                    index, descriptor.reference(), e.getCode(), e.getMessage());
+            return new BatchItemResult(index, descriptor.reference(), ItemStatus.POLICY_ERROR,
+                    null, e.getCode().name(), e.getMessage());
         }
-        return new BatchItemResult(index, descriptor.reference(), ItemStatus.EVALUATED,
-                report, null, null);
     }
 
     private BatchItemResult recordInputError(Caller caller, int index, String reference,

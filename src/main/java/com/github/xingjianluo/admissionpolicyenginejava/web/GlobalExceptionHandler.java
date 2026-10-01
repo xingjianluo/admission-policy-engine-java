@@ -20,7 +20,9 @@ import java.time.Instant;
  *   <li>401：{@link ErrorCode#UNAUTHORIZED}（鉴权拒绝，与策略 DENY 区分）；</li>
  *   <li>409：{@link ErrorCode#POLICY_VERSION_CONFLICT}（并发更新冲突）；</li>
  *   <li>404：{@link ErrorCode#POLICY_VERSION_NOT_FOUND}；</li>
- *   <li>422：输入/格式/指纹/schema 类可归类错误（注意：这不是策略 DENY）；</li>
+ *   <li>422：输入/格式/指纹/schema/规则集内容类可归类错误（注意：这不是策略 DENY）；</li>
+ *   其中规则集不合法 POLICY_RULESET_INVALID 也映射为 422：发布与预演共用同一套规则校验，
+ *   条件参数缺失/格式错误/严重级别档位不允许时统一以该码拒绝。</li>
  *   <li>400：请求本身不合法。</li>
  * </ul>
  * 注意：策略判定为 DENY 是正常 200 响应体内的 decision 字段，不会走异常通道。
